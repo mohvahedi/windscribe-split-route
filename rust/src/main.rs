@@ -21,7 +21,41 @@ const REG_PERSISTENT_ROUTES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Pa
 const DNS_POLICY_PATH: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
 const SAMPLE_NET: [u8; 4] = [2, 57, 3, 0];
 
+#[link(name = "dnsapi")]
+extern "system" {
+    fn DnsFlushResolverCache() -> i32;
+}
+
 static CIDRS_RAW: &str = include_str!("../iran_cidrs.txt");
+
+const DOMESTIC_NAMESPACES: &[&str] = &[
+    ".ir",
+    "digikala.com",
+    "torob.com",
+    "snapp.express",
+    "aparat.com",
+    "filimo.com",
+    "telewebion.com",
+    "eitaa.com",
+    "bale.ai",
+    "gap.im",
+    "neshan.org",
+    "basalam.com",
+    "snapptrip.com",
+    "sheypoor.com",
+    "cinematicket.org",
+    "tiwall.com",
+    "fidibo.com",
+    "taaghche.com",
+    "paziresh24.com",
+];
+
+const DOMESTIC_DNS_SERVERS: &[&str] = &[
+    "78.157.42.100",
+    "78.157.42.101",
+    "185.51.200.2",
+    "1.1.1.1",
+];
 
 struct Cidr {
     ip: u32, // network byte order
@@ -33,6 +67,7 @@ struct PhysicalAdapter {
     gateway_str: String,
     interface_ip_str: String,
     if_index: u32,
+    metric: u32,
     name: String,
     adapter_type: &'static str,
 }
@@ -70,6 +105,12 @@ fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
+fn flush_dns_cache() {
+    unsafe {
+        DnsFlushResolverCache();
+    }
+}
+
 fn load_cidrs() -> Vec<Cidr> {
     let mut list = Vec::with_capacity(1800);
     for line in CIDRS_RAW.lines() {
@@ -89,7 +130,39 @@ fn load_cidrs() -> Vec<Cidr> {
     list
 }
 
+/// Detects the physical internet-facing default adapter.
+/// Inspects Windows kernel default routes (`0.0.0.0/0`) from `GetIpForwardTable2`,
+/// selects non-VPN routes, and cross-references `GetAdaptersAddresses` to verify
+/// physical hardware (Ethernet or Wi-Fi) with the lowest metric.
 fn detect_physical_interface() -> Option<PhysicalAdapter> {
+    // 1. Get default routes from kernel forward table
+    let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let res = unsafe { GetIpForwardTable2(AF_INET as u16, &mut table_ptr) };
+    if res != 0 || table_ptr.is_null() {
+        return None;
+    }
+
+    let mut default_routes: Vec<(u32, u32, u32)> = Vec::new(); // (if_index, next_hop_ip, metric)
+    unsafe {
+        let t = &*table_ptr;
+        let slice = std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize);
+        for row in slice {
+            if row.DestinationPrefix.PrefixLength == 0 {
+                let nh = row.NextHop.Ipv4.sin_addr.S_un.S_addr;
+                let b = nh.to_ne_bytes();
+                // Filter out on-link (0.0.0.0), APIPA, loopback, and obvious internal VPN subnets
+                if nh != 0 && b[0] != 127 && (b[0] != 169 || b[1] != 254) {
+                    default_routes.push((row.InterfaceIndex, nh, row.Metric));
+                }
+            }
+        }
+        FreeMibTable(table_ptr as *const _);
+    }
+
+    // Sort candidate default routes by metric ascending (lowest metric = primary interface)
+    default_routes.sort_by_key(|r| r.2);
+
+    // 2. Query adapter details from GetAdaptersAddresses
     let mut buf_len: u32 = 0;
     unsafe {
         GetAdaptersAddresses(
@@ -118,96 +191,83 @@ fn detect_physical_interface() -> Option<PhysicalAdapter> {
         return None;
     }
 
-    let mut curr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-    while !curr.is_null() {
-        let a = unsafe { &*curr };
+    // 3. Match candidate routes against physical adapters
+    for (candidate_idx, candidate_gw, candidate_metric) in default_routes {
+        let mut curr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !curr.is_null() {
+            let a = unsafe { &*curr };
+            let if_idx = unsafe { a.Anonymous1.Anonymous.IfIndex };
 
-        // IfType: 6 = Ethernet, 71 = Wi-Fi. OperStatus: 1 = Up
-        if (a.IfType == IF_TYPE_ETHERNET_CSMACD || a.IfType == IF_TYPE_IEEE80211)
-            && a.OperStatus == 1
-        {
-            let desc = if !a.Description.is_null() {
-                let slice = unsafe {
-                    let mut len = 0;
-                    while *a.Description.add(len) != 0 {
-                        len += 1;
-                    }
-                    std::slice::from_raw_parts(a.Description, len)
-                };
-                String::from_utf16_lossy(slice)
-            } else {
-                String::new()
-            };
-
-            let name = if !a.FriendlyName.is_null() {
-                let slice = unsafe {
-                    let mut len = 0;
-                    while *a.FriendlyName.add(len) != 0 {
-                        len += 1;
-                    }
-                    std::slice::from_raw_parts(a.FriendlyName, len)
-                };
-                String::from_utf16_lossy(slice)
-            } else {
-                String::new()
-            };
-
-            // Filter out virtual/tunnel devices
-            if !desc.contains("Hyper-V")
-                && !desc.contains("Virtual")
-                && !name.contains("vEthernet")
-                && !name.contains("TAP")
-                && !name.contains("Wintun")
+            if if_idx == candidate_idx
+                && (a.IfType == IF_TYPE_ETHERNET_CSMACD || a.IfType == IF_TYPE_IEEE80211)
+                && a.OperStatus == 1
             {
-                let mut gw_ip: Option<u32> = None;
-                let mut gw_str = String::new();
-                let mut unicast_ip_str = String::new();
+                let desc = if !a.Description.is_null() {
+                    let mut len = 0;
+                    while unsafe { *a.Description.add(len) } != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(a.Description, len) })
+                } else {
+                    String::new()
+                };
 
-                if !a.FirstGatewayAddress.is_null() {
-                    let gw_node = unsafe { &*a.FirstGatewayAddress };
-                    if !gw_node.Address.lpSockaddr.is_null() {
-                        let sin = unsafe { &*(gw_node.Address.lpSockaddr as *const SOCKADDR_IN) };
-                        let ip_val = unsafe { sin.sin_addr.S_un.S_addr };
-                        if ip_val != 0 {
+                let name = if !a.FriendlyName.is_null() {
+                    let mut len = 0;
+                    while unsafe { *a.FriendlyName.add(len) } != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(a.FriendlyName, len) })
+                } else {
+                    String::new()
+                };
+
+                // Exclude any virtual / Hyper-V adapters
+                if !desc.contains("Hyper-V")
+                    && !desc.contains("Virtual")
+                    && !name.contains("vEthernet")
+                    && !name.contains("TAP")
+                    && !name.contains("Wintun")
+                    && !name.contains("TunnelBear")
+                    && !name.contains("Nord")
+                    && !name.contains("Windscribe")
+                {
+                    // Find unicast IPv4
+                    let mut unicast_ip_str = String::new();
+                    if !a.FirstUnicastAddress.is_null() {
+                        let u_node = unsafe { &*a.FirstUnicastAddress };
+                        if !u_node.Address.lpSockaddr.is_null() {
+                            let sin = unsafe { &*(u_node.Address.lpSockaddr as *const SOCKADDR_IN) };
+                            let ip_val = unsafe { sin.sin_addr.S_un.S_addr };
                             let b = ip_val.to_ne_bytes();
-                            gw_str = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
-                            gw_ip = Some(ip_val);
+                            if b[0] != 169 || b[1] != 254 {
+                                unicast_ip_str = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                            }
                         }
                     }
-                }
 
-                if !a.FirstUnicastAddress.is_null() {
-                    let u_node = unsafe { &*a.FirstUnicastAddress };
-                    if !u_node.Address.lpSockaddr.is_null() {
-                        let sin = unsafe { &*(u_node.Address.lpSockaddr as *const SOCKADDR_IN) };
-                        let ip_val = unsafe { sin.sin_addr.S_un.S_addr };
-                        let b = ip_val.to_ne_bytes();
-                        if b[0] != 169 || b[1] != 254 {
-                            unicast_ip_str = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
-                        }
-                    }
-                }
+                    let b = candidate_gw.to_ne_bytes();
+                    let gw_str = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
 
-                if let Some(gw) = gw_ip {
-                    if !unicast_ip_str.is_empty() {
-                        return Some(PhysicalAdapter {
-                            gateway_ip: gw,
-                            gateway_str: gw_str,
-                            interface_ip_str: unicast_ip_str,
-                            if_index: unsafe { a.Anonymous1.Anonymous.IfIndex },
-                            name,
-                            adapter_type: if a.IfType == IF_TYPE_ETHERNET_CSMACD {
-                                "Ethernet"
-                            } else {
-                                "Wi-Fi"
-                            },
-                        });
-                    }
+                    return Some(PhysicalAdapter {
+                        gateway_ip: candidate_gw,
+                        gateway_str: gw_str,
+                        interface_ip_str: unicast_ip_str,
+                        if_index: candidate_idx,
+                        metric: candidate_metric,
+                        name,
+                        adapter_type: if a.IfType == IF_TYPE_ETHERNET_CSMACD {
+                            "Ethernet"
+                        } else {
+                            "Wi-Fi"
+                        },
+                    });
                 }
             }
+            curr = a.Next;
         }
-        curr = a.Next;
     }
+
     None
 }
 
@@ -215,18 +275,20 @@ fn get_physical_gateway(settle: bool) -> Option<PhysicalAdapter> {
     if settle {
         sleep(Duration::from_millis(1000));
     }
-    for attempt in 0..3 {
+    // Up to 5 attempts with 500ms intervals to allow DHCP handshake to complete
+    for attempt in 0..5 {
         if let Some(adapter) = detect_physical_interface() {
             return Some(adapter);
         }
-        if settle && attempt < 2 {
+        if settle && attempt < 4 {
             sleep(Duration::from_millis(500));
         }
     }
     None
 }
 
-fn is_route_active(gateway_ip: u32) -> bool {
+/// Checks if sample Iranian network is already pointing to the target gateway on target interface.
+fn is_route_active(gateway_ip: u32, if_index: u32) -> bool {
     let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
     row.DestinationPrefix.Prefix.si_family = AF_INET as u16;
     row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET as u16;
@@ -236,7 +298,7 @@ fn is_route_active(gateway_ip: u32) -> bool {
     let res = unsafe { GetIpForwardEntry2(&mut row) };
     if res == 0 {
         let nh = unsafe { row.NextHop.Ipv4.sin_addr.S_un.S_addr };
-        return nh == gateway_ip;
+        return nh == gateway_ip && row.InterfaceIndex == if_index;
     }
     false
 }
@@ -314,9 +376,7 @@ fn is_nrpt_active() -> (bool, String) {
         }
 
         let mut child_key: HKEY = std::ptr::null_mut();
-        if unsafe {
-            RegOpenKeyExW(hkey, key_name_buf.as_ptr(), 0, KEY_READ, &mut child_key)
-        } == 0 {
+        if unsafe { RegOpenKeyExW(hkey, key_name_buf.as_ptr(), 0, KEY_READ, &mut child_key) } == 0 {
             let mut val_buf = [0u8; 512];
             let mut val_len = val_buf.len() as u32;
             let val_name = to_wide("DisplayName");
@@ -349,7 +409,9 @@ fn is_nrpt_active() -> (bool, String) {
                     } == 0 {
                         String::from_utf16_lossy(unsafe {
                             std::slice::from_raw_parts(srv_buf.as_ptr() as *const u16, (srv_len / 2) as usize)
-                        }).trim_matches('\0').to_string()
+                        })
+                        .trim_matches('\0')
+                        .to_string()
                     } else {
                         "Electro DNS".to_string()
                     };
@@ -374,12 +436,29 @@ fn ensure_nrpt_policy() -> bool {
         return true;
     }
 
-    let cmd = "Add-DnsClientNrptRule -Namespace @('.ir', 'digikala.com', 'torob.com', 'snapp.express', 'aparat.com', 'filimo.com', 'eitaa.com', 'bale.ai', 'telewebion.com', 'gap.im') -Nameservers @('78.157.42.100', '78.157.42.101') -DisplayName 'IranDomesticDNS'";
+    let ns_list = DOMESTIC_NAMESPACES
+        .iter()
+        .map(|s| format!("'{}'", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let srv_list = DOMESTIC_DNS_SERVERS
+        .iter()
+        .map(|s| format!("'{}'", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let cmd = format!(
+        "Add-DnsClientNrptRule -Namespace @({}) -Nameservers @({}) -DisplayName 'IranDomesticDNS'",
+        ns_list, srv_list
+    );
+
     let status = Command::new("powershell")
-        .args(["-NoProfile", "-Command", cmd])
+        .args(["-NoProfile", "-Command", &cmd])
         .creation_flags(CREATE_NO_WINDOW)
         .status();
 
+    flush_dns_cache();
     status.map(|s| s.success()).unwrap_or(false)
 }
 
@@ -413,9 +492,7 @@ fn remove_nrpt_policy() {
         }
 
         let mut child_key: HKEY = std::ptr::null_mut();
-        if unsafe {
-            RegOpenKeyExW(hkey, key_name_buf.as_ptr(), 0, KEY_READ, &mut child_key)
-        } == 0 {
+        if unsafe { RegOpenKeyExW(hkey, key_name_buf.as_ptr(), 0, KEY_READ, &mut child_key) } == 0 {
             let mut val_buf = [0u8; 512];
             let mut val_len = val_buf.len() as u32;
             let val_name = to_wide("DisplayName");
@@ -447,6 +524,7 @@ fn remove_nrpt_policy() {
         unsafe { RegDeleteKeyW(hkey, null_term.as_ptr()) };
     }
     unsafe { RegCloseKey(hkey) };
+    flush_dns_cache();
 }
 
 fn purge_stale_persistent_routes(cidrs: &[Cidr]) {
@@ -519,15 +597,22 @@ fn test_connectivity() {
                 if let Some((code, _)) = res.split_once(':') {
                     if code == "200" || code == "301" || code == "302" {
                         if url.contains("ipinfo.io") {
-                            // Extract IP
                             let ip_res = Command::new("curl")
                                 .args(["-s", "-m", "5", url])
                                 .creation_flags(CREATE_NO_WINDOW)
                                 .output();
                             let ip_info = if let Ok(ip_out) = ip_res {
                                 let body = String::from_utf8_lossy(&ip_out.stdout);
-                                let ip = body.lines().find(|l| l.contains("\"ip\":")).map(|l| l.replace("\"", "").replace(",", "").trim().to_string()).unwrap_or_default();
-                                let city = body.lines().find(|l| l.contains("\"city\":")).map(|l| l.replace("\"", "").replace(",", "").trim().to_string()).unwrap_or_default();
+                                let ip = body
+                                    .lines()
+                                    .find(|l| l.contains("\"ip\":"))
+                                    .map(|l| l.replace('\"', "").replace(',', "").trim().to_string())
+                                    .unwrap_or_default();
+                                let city = body
+                                    .lines()
+                                    .find(|l| l.contains("\"city\":"))
+                                    .map(|l| l.replace('\"', "").replace(',', "").trim().to_string())
+                                    .unwrap_or_default();
                                 format!("{} ({})", ip, city)
                             } else {
                                 "Connected".to_string()
@@ -567,7 +652,7 @@ fn main() {
             let _guard = if silent {
                 match InstanceGuard::try_acquire() {
                     Some(g) => Some(g),
-                    None => return, // Already running
+                    None => return, // Another sync is already in progress
                 }
             } else {
                 None
@@ -577,7 +662,7 @@ fn main() {
                 Some(a) => a,
                 None => {
                     if !silent {
-                        eprintln!("[-] Could not detect active physical gateway. Adapter may still be initializing.");
+                        eprintln!("[-] Could not detect active physical gateway. Network adapter may still be initializing.");
                     }
                     return;
                 }
@@ -585,20 +670,27 @@ fn main() {
 
             ensure_nrpt_policy();
 
-            if !force && is_route_active(adapter.gateway_ip) {
+            // Check if routes are already active for THIS gateway on THIS interface
+            if !force && is_route_active(adapter.gateway_ip, adapter.if_index) {
                 if !silent {
-                    println!("[+] Iran routes already active and pointed to {}. Nothing to do.", adapter.gateway_str);
+                    println!(
+                        "[+] Iran routes already active and pointed to {} on interface {}. Nothing to do.",
+                        adapter.gateway_str, adapter.if_index
+                    );
                 }
                 return;
             }
 
             if !silent {
                 println!(
-                    "[*] Detected physical gateway: {} (Adapter: {}, Index: {})",
-                    adapter.gateway_str, adapter.name, adapter.if_index
+                    "[*] Detected physical gateway: {} (Adapter: {}, Index: {}, Metric: {})",
+                    adapter.gateway_str, adapter.name, adapter.if_index, adapter.metric
                 );
                 println!("[*] Applying {} Iranian CIDR routes natively...", cidrs.len());
             }
+
+            // If we are migrating from a previous gateway/interface, wipe older routes first
+            delete_routes(&cidrs);
 
             let t0 = Instant::now();
             let applied = apply_routes(adapter.gateway_ip, adapter.if_index, &cidrs);
@@ -636,7 +728,7 @@ fn main() {
                     a.name.clone(),
                     a.adapter_type,
                     a.if_index.to_string(),
-                    is_route_active(a.gateway_ip),
+                    is_route_active(a.gateway_ip, a.if_index),
                 )
             } else {
                 (
