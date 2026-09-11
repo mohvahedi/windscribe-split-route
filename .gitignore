@@ -5,3 +5,5 @@ __pycache__/
 .Python
 *.xml
 *.log
+target/
+*.exe
