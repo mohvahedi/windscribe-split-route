@@ -30,7 +30,7 @@ extern "system" {
     fn DnsFlushResolverCache() -> i32;
 }
 
-static CIDRS_RAW: &str = include_str!("../iran_cidrs.txt");
+static CIDRS_RAW: &str = include_str!("../routes.txt");
 
 const DOMESTIC_NAMESPACES: &[&str] = &[
     ".ir",
@@ -77,7 +77,7 @@ struct InstanceGuard {
 
 impl InstanceGuard {
     fn try_acquire() -> Option<Self> {
-        let name = to_wide("Global\\IranRouteSyncMutex");
+        let name = to_wide("Global\\SplitRouteSyncMutex");
         let handle = unsafe { CreateMutexW(std::ptr::null(), TRUE, name.as_ptr()) };
         if handle.is_null() {
             return None;
@@ -123,10 +123,10 @@ fn flush_dns_cache() {
 fn get_log_path() -> std::path::PathBuf {
     if let Ok(exe) = env::current_exe() {
         if let Some(parent) = exe.parent() {
-            return parent.join("iran-route.log");
+            return parent.join("split-route.log");
         }
     }
-    std::path::PathBuf::from(r"C:\Users\Lion\bin\iran-route.log")
+    std::path::PathBuf::from(r"C:\Users\Lion\bin\split-route.log")
 }
 
 fn log_event(msg: &str) {
@@ -437,7 +437,7 @@ fn is_nrpt_active() -> (bool, String) {
                 let disp = String::from_utf16_lossy(unsafe {
                     std::slice::from_raw_parts(val_buf.as_ptr() as *const u16, (val_len / 2) as usize)
                 });
-                if disp.trim_matches('\0') == "IranDomesticDNS" {
+                if disp.trim_matches('\0') == "DirectSplitDNS" {
                     let mut srv_buf = [0u8; 512];
                     let mut srv_len = srv_buf.len() as u32;
                     let srv_name = to_wide("GenericDNSServers");
@@ -524,7 +524,7 @@ fn ensure_nrpt_policy() -> bool {
     }
 
     unsafe {
-        let disp_w = to_wide("IranDomesticDNS");
+        let disp_w = to_wide("DirectSplitDNS");
         RegSetValueExW(
             hrule,
             to_wide("DisplayName").as_ptr(),
@@ -628,7 +628,7 @@ fn remove_nrpt_policy() {
                 let disp = String::from_utf16_lossy(unsafe {
                     std::slice::from_raw_parts(val_buf.as_ptr() as *const u16, (val_len / 2) as usize)
                 });
-                if disp.trim_matches('\0') == "IranDomesticDNS" {
+                if disp.trim_matches('\0') == "DirectSplitDNS" {
                     to_delete.push(key_name_buf[..name_len as usize].to_vec());
                 }
             }
@@ -703,9 +703,9 @@ struct TestResult {
 
 fn run_parallel_connectivity_test() -> Vec<TestResult> {
     let targets: &[(&str, &'static str, bool)] = &[
-        ("https://shaparak.ir", "Domestic Bank/Payment Gateway", false),
-        ("https://digikala.com", "Domestic E-Commerce (.com)", false),
-        ("https://divar.ir", "Domestic Classifieds (.ir)", false),
+        ("https://shaparak.ir", "Regional Payment Gateway", false),
+        ("https://digikala.com", "Regional E-Commerce (.com)", false),
+        ("https://divar.ir", "Regional Classifieds (.ir)", false),
         ("https://ipinfo.io/json", "International VPN Endpoint", true),
     ];
 
@@ -828,13 +828,13 @@ fn print_connectivity_benchmarks() {
 }
 
 fn print_help() {
-    println!("\x1b[1;36miran-route\x1b[0m 1.1.0 - Native Kernel Route & DNS Split-Tunnel Engine");
-    println!("High-performance domestic CIDR bypass for Windscribe & Windows full-tunnel VPNs.\n");
+    println!("\x1b[1;36msplit-route\x1b[0m 1.1.0 - Native Kernel Route & DNS Split-Tunnel Engine");
+    println!("High-performance direct CIDR bypass for Windscribe & Windows full-tunnel VPNs.\n");
     println!("\x1b[1mUSAGE:\x1b[0m");
-    println!("    iran-route [COMMAND] [OPTIONS]\n");
+    println!("    split-route [COMMAND] [OPTIONS]\n");
     println!("\x1b[1mCOMMANDS:\x1b[0m");
     println!("    \x1b[32mstatus\x1b[0m      Display current physical adapter, live routes, DNS policy & ping test");
-    println!("    \x1b[32menable\x1b[0m      Inject 1,740 domestic CIDRs into kernel table and activate DNS split-tunnel");
+    println!("    \x1b[32menable\x1b[0m      Inject direct CIDRs into kernel table and activate DNS split-tunnel");
     println!("    \x1b[32mdisable\x1b[0m     Remove all injected routes and DNS policy from system");
     println!("    \x1b[32mtest\x1b[0m        Run fast parallel latency and IP routing verification");
     println!("    \x1b[32mlog\x1b[0m         View recent background event synchronization logs\n");
@@ -886,7 +886,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("iran-route 1.1.0 (native rust engine)");
+        println!("split-route 1.1.0 (native rust engine)");
         return;
     }
 
@@ -923,7 +923,7 @@ fn main() {
                 ));
                 if !silent {
                     println!(
-                        "\x1b[1;32m[+]\x1b[0m Iran routes already active and pointed to {} on interface {}. Nothing to do.",
+                        "\x1b[1;32m[+]\x1b[0m Direct routes already active and pointed to {} on interface {}. Nothing to do.",
                         adapter.gateway_str, adapter.if_index
                     );
                 }
@@ -935,7 +935,7 @@ fn main() {
                     "[*] Detected physical gateway: \x1b[1;36m{}\x1b[0m (Adapter: {}, Index: {}, Metric: {})",
                     adapter.gateway_str, adapter.name, adapter.if_index, adapter.metric
                 );
-                println!("[*] Applying {} Iranian CIDR routes natively...", cidrs.len());
+                println!("[*] Applying {} direct CIDR routes natively...", cidrs.len());
             }
 
             delete_routes(&cidrs);
@@ -961,7 +961,7 @@ fn main() {
         }
         "disable" => {
             if !silent {
-                println!("[*] Removing {} Iranian CIDR routes from live routing table...", cidrs.len());
+                println!("[*] Removing {} direct CIDR routes from live routing table...", cidrs.len());
             }
             let t0 = Instant::now();
             let deleted = delete_routes(&cidrs);
@@ -1001,7 +1001,7 @@ fn main() {
 
             let (nrpt_active, nrpt_servers) = is_nrpt_active();
 
-            println!("\x1b[1;36mIran Route Status (Native Rust Engine 1.1.0):\x1b[0m");
+            println!("\x1b[1;36mSplit Route Status (Native Rust Engine 1.1.0):\x1b[0m");
             println!("  Physical Adapter:         {} ({}, Index: {})", name, if_type, if_idx);
             println!("  Physical Gateway:         {} (Local IP: {})", gw_str, ip_str);
             println!(

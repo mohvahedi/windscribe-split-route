@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "iran-route"
-version = "1.0.0"
+name = "split-route"
+version = "1.1.0"
 dependencies = [
  "windows-sys",
 ]
